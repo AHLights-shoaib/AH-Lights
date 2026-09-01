@@ -57,7 +57,7 @@ footer{text-align:center;color:#8e8e93;font-size:11px;padding:12px}
   <div class="scanBox">
     <div style="font-size:34px">📷</div><b>Scan Inventory List</b>
     <div class="hint" style="margin-top:5px">Take a clear, straight photo of one page at a time for best OCR accuracy.</div>
-    <input id="bulkPhoto" type="file" accept="image/*" capture="environment" multiple style="display:none">
+    <input id="bulkPhoto" type="file" accept="image/*" capture="environment" style="display:none">
     <button class="scanBtn" onclick="document.getElementById('bulkPhoto').click()">Take Photo / Choose Photo</button>
     <img id="scanPreview" class="scanPreview" style="display:none" alt="Inventory list preview">
     <div id="scanStatus" class="scanStatus"></div>
@@ -116,7 +116,7 @@ function closeBulk(){document.getElementById('bulk').classList.remove('show')}
 document.getElementById('itemForm').addEventListener('submit',e=>{
  e.preventDefault();
  const id=document.getElementById('editId').value;
- const base={code:fCode.value.trim(),item:fItem.value.trim(),category:normalizeCategory(fCat.value.trim()),quantity:Number(fQty.value)||0,retail:Number(fRetail.value)||0};
+ const base={code:fCode.value.trim(),item:fItem.value.trim(),category:fCat.value.trim().toUpperCase(),quantity:Number(fQty.value)||0,retail:Number(fRetail.value)||0};
  const file=fPhoto.files[0];
  const existing=id?inventory.find(i=>i.id===id):null;
  readPhoto(file,photo=>{
@@ -127,7 +127,7 @@ document.getElementById('itemForm').addEventListener('submit',e=>{
 });
 function deleteItem(id){if(!confirm('Delete this inventory item?'))return;inventory=inventory.filter(i=>i.id!==id);saveInventory();render()}
 let ocrItems=[];
-const OCR_CATS=['CHANDLIER','HANGING LIGHTS','WALL LIGHTS','CEILING LIGHTS','OUTDOOR LIGHTS','LED STRIPS','PICTURE LIGHT','VANITY LIGHTS','OTHER'];
+const OCR_CATS=['CHANDLIERS','HANGING LIGHTS','WALL LIGHTS','CEILING LIGHTS','OUTDOOR LIGHTS','LED STRIPS'];
 function normalizeCategory(raw){
  const t=String(raw||'').toUpperCase();
  if(/OUTDOOR|GARDEN|FACADE|STREET/.test(t))return 'OUTDOOR LIGHTS';
@@ -135,69 +135,105 @@ function normalizeCategory(raw){
  if(/CEILING|DOWNLIGHT|PANEL/.test(t))return 'CEILING LIGHTS';
  if(/HANGING|PENDANT/.test(t))return 'HANGING LIGHTS';
  if(/LED\s*STRIP|STRIP\s*LIGHT|TAPE\s*LIGHT/.test(t))return 'LED STRIPS';
- if(/PICTURE\s*LIGHT/.test(t))return 'PICTURE LIGHT';
- if(/VANITY/.test(t))return 'VANITY LIGHTS';
- if(/CHANDLIER|CHANDELIER/.test(t))return 'CHANDLIER';
+ if(/CHANDLIER|CHANDELIER/.test(t))return 'CHANDLIERS';
  return 'OTHER';
 }
 function inferCategory(text){return normalizeCategory(text)}
 function guessCode(text){
- let m=String(text).match(/\b(?:[A-Z]{0,3}\s*)?\d[A-Z0-9\-\/]*\b/i);
+ const m=String(text).match(/\b(?:[A-Z]{0,3}\s*)?\d[A-Z0-9\-\/]*\b/i);
  return m?m[0].replace(/\s+/g,'').trim():'';
 }
-function cleanOcrLines(text){
- return String(text||'').split(/\r?\n/).map(x=>x.replace(/[|]+/g,' ').replace(/\s{2,}/g,' ').trim()).filter(x=>x.length>=3);
+function cleanText(s){return String(s||'').replace(/[|]/g,' ').replace(/\s+/g,' ').trim()}
+function numberTokens(words){
+ return words.map((w,i)=>({w,i,n:(w.text||'').replace(/[^0-9,\.]/g,'')})).filter(x=>/^\d[\d,.]*$/.test(x.n));
+}
+function parseTSV(tsv, imageWidth){
+ const rows={};
+ String(tsv||'').split(/\r?\n/).slice(1).forEach(line=>{
+   const a=line.split('\t'); if(a.length<12)return;
+   const level=Number(a[0]), conf=Number(a[10]); const text=cleanText(a[11]);
+   if(level!==5 || !text || conf<5)return;
+   const left=Number(a[6])||0, top=Number(a[7])||0, width=Number(a[8])||0, height=Number(a[9])||0;
+   const key=Math.round((top+height/2)/Math.max(8,height*0.72));
+   (rows[key]||(rows[key]=[])).push({text,left,top,width,height,conf});
+ });
+ const sorted=Object.values(rows).sort((a,b)=>Math.min(...a.map(x=>x.top))-Math.min(...b.map(x=>x.top)));
+ const out=[];
+ for(const words0 of sorted){
+   const words=words0.sort((a,b)=>a.left-b.left);
+   if(words.length<2)continue;
+   const nums=numberTokens(words);
+   let retail='', quantity='', code='', item='';
+   // Table layout: code at the left, description in the middle, quantity near the right, retail at the far right.
+   const rightNums=nums.filter(x=>x.w.left>imageWidth*0.52).sort((a,b)=>a.w.left-b.w.left);
+   if(rightNums.length){
+     const last=rightNums[rightNums.length-1];
+     const v=last.n.replace(/,/g,'');
+     if(Number(v)>=100 || /,/.test(last.n)) retail=v;
+     if(rightNums.length>1){
+       const q=rightNums[rightNums.length-2].n.replace(/,/g,'');
+       if(Number(q)>=1 && Number(q)<=999) quantity=q;
+     }
+   }
+   // Find the first plausible code in the left quarter. Prefer tokens containing letters/digits.
+   const leftWords=words.filter(w=>w.left<imageWidth*0.28);
+   for(let i=0;i<leftWords.length;i++){
+     const t=leftWords[i].text.replace(/[^A-Za-z0-9\-\/]/g,'');
+     if(/\d/.test(t) && t.length>=2){code=t;break}
+   }
+   if(!code)code=guessCode(words.slice(0,3).map(w=>w.text).join(' '));
+   const used=new Set();
+   if(code){ const idx=words.findIndex(w=>w.text.replace(/[^A-Za-z0-9\-\/]/g,'')===code); if(idx>=0)used.add(idx); }
+   nums.forEach(x=>{if(x.i===rightNums.at(-1)?.i || x.i===rightNums.at(-2)?.i)used.add(x.i)});
+   item=words.filter((w,i)=>!used.has(i) && w.left<imageWidth*0.78).map(w=>w.text).join(' ');
+   item=cleanText(item).replace(/^[-:|]+|[-:|]+$/g,'');
+   // Avoid accepting obvious headings, totals and OCR noise as products.
+   if(/^(item|code|description|category|quantity|qty|retail|price|stock|sub total|total)$/i.test(item))continue;
+   if(!code && !item)continue;
+   const category=inferCategory(item);
+   const conf=Math.round(words.reduce((s,w)=>s+w.conf,0)/words.length);
+   if((code||item).replace(/[\s\-,:|]/g,'').length>=2)out.push({code,item,category,quantity,retail,_conf:conf});
+ }
+ return out;
 }
 function parseOCR(text){
-  const lines=cleanOcrLines(text), out=[];
-  const categoryWords=/CHANDLIER|CHANDELIER|HANGING|PENDANT|WALL|SCONCE|CEILING|DOWNLIGHT|PANEL|OUTDOOR|GARDEN|FACADE|STREET|LED\s*STRIP|STRIP\s*LIGHT|TAPE\s*LIGHT/i;
-
-  for(let raw of lines){
-    let line=raw.trim();
-    if(/^(item|code|product|description|category|quantity|qty|retail|price|stock)\b/i.test(line)) continue;
-
-    let parts=line.split(/\t+|\s{3,}/).map(s=>s.trim()).filter(Boolean);
-    let category='', quantity='', retail='', code='', item='';
-
-    if(parts.length>=2){
-      const numeric=[];
-      parts.forEach((p,i)=>{
-        const nums=(p.match(/\b\d[\d,]*(?:\.\d+)?\b/g)||[]);
-        if(nums.length) numeric.push({i,nums});
-      });
-
-      if(numeric.length){
-        const last=numeric[numeric.length-1].nums[numeric[numeric.length-1].nums.length-1].replace(/,/g,'');
-        if(Number(last)>=500) retail=last;
-      }
-      if(numeric.length>=2){
-        const q=numeric[numeric.length-2].nums[numeric[numeric.length-2].nums.length-1].replace(/,/g,'');
-        if(Number(q)>=1 && Number(q)<=999) quantity=q;
-      }
-
-      const catPart=parts.find(p=>categoryWords.test(p));
-      if(catPart) category=inferCategory(catPart);
-
-      const codePart=parts.find(p=>/^[A-Z]{0,3}\s*\d[A-Z0-9\-\/]*$/i.test(p.replace(/\s+/g,'')));
-      if(codePart) code=codePart.replace(/\s+/g,'').trim();
-
-      const remaining=parts.filter(p=>p!==catPart && p!==codePart && p!==retail && p!==quantity);
-      item=remaining.join(' ').trim();
-    }
-
-    if(!code) code=guessCode(line);
-    if(!item){
-      item=line;
-      if(code) item=item.replace(new RegExp('^\\s*'+code.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\s*[-,:|]?\\s*','i'),'').trim();
-      if(retail) item=item.replace(new RegExp('\\b'+retail.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\b\\s*$',''),'').trim();
-    }
-    if(!category) category=inferCategory(line);
-
-    if(item.replace(/[\s\-,:|]/g,'').length>=2 || code)
-      out.push({code,item,category,quantity,retail});
-  }
-  return out;
-}function renderOCRReview(){
+ // Fallback for engines/older browsers that return only plain text.
+ const out=[];
+ String(text||'').split(/\r?\n/).map(cleanText).filter(x=>x.length>=3).forEach(line=>{
+   if(/^(item|code|product|description|category|quantity|qty|retail|price|stock|total|sub total)\b/i.test(line))return;
+   const nums=line.match(/\b\d[\d,]*(?:\.\d+)?\b/g)||[];
+   const retail=nums.length?nums[nums.length-1].replace(/,/g,''):'';
+   const quantity=nums.length>1?nums[nums.length-2].replace(/,/g,''):'';
+   const code=guessCode(line);
+   let item=line;
+   if(code)item=item.replace(new RegExp('^\\s*'+code.replace(/[.*+?^${}()|[\\]\\]/g,'\\$&')+'\\s*[-,:|]?\\s*','i'),'').trim();
+   if(retail)item=item.replace(new RegExp('\\b'+retail+'\\s*$'),'').trim();
+   if(item||code)out.push({code,item,category:inferCategory(item),quantity,retail,_conf:20});
+ });
+ return out;
+}
+function scoreOCR(rows){
+ if(!rows.length)return -1;
+ let score=rows.length*0.5;
+ rows.forEach(x=>{if(x.code)score+=2;if(x.quantity)score+=1;if(x.retail)score+=2;if(x.item&&x.item.length>=5)score+=1;if(x._conf)score+=x._conf/50});
+ return score;
+}
+function preprocessImage(file){
+ return new Promise((resolve,reject)=>{
+   const img=new Image(); img.onload=()=>{
+     const scale=Math.min(3,Math.max(1.6,2200/Math.max(img.naturalWidth,img.naturalHeight)));
+     const c=document.createElement('canvas'); c.width=Math.round(img.naturalWidth*scale); c.height=Math.round(img.naturalHeight*scale);
+     const ctx=c.getContext('2d',{willReadFrequently:true}); ctx.drawImage(img,0,0,c.width,c.height);
+     const d=ctx.getImageData(0,0,c.width,c.height), p=d.data;
+     for(let i=0;i<p.length;i+=4){
+       const g=0.299*p[i]+0.587*p[i+1]+0.114*p[i+2];
+       const v=Math.max(0,Math.min(255,(g-128)*1.45+128)); p[i]=p[i+1]=p[i+2]=v;
+     }
+     ctx.putImageData(d,0,0); resolve(c.toDataURL('image/jpeg',0.92));
+   }; img.onerror=reject; img.src=URL.createObjectURL(file);
+ });
+}
+function renderOCRReview(){
  const body=document.getElementById('reviewBody');
  body.innerHTML=ocrItems.map((x,i)=>`<tr>
  <td><input data-i="${i}" data-k="code" value="${esc(x.code)}"></td>
@@ -208,39 +244,31 @@ function parseOCR(text){
  document.getElementById('ocrReview').style.display=ocrItems.length?'block':'none';
  body.querySelectorAll('[data-i]').forEach(el=>el.addEventListener('input',()=>{ocrItems[Number(el.dataset.i)][el.dataset.k]=el.value}));
 }
-function preprocessImage(file){
- return new Promise((resolve,reject)=>{
-  const img=new Image();
-  img.onload=()=>{try{
-   const maxW=2400, scale=Math.min(1,maxW/img.naturalWidth), w=Math.max(1,Math.round(img.naturalWidth*scale)), h=Math.max(1,Math.round(img.naturalHeight*scale));
-   const c=document.createElement('canvas'); c.width=w; c.height=h;
-   const ctx=c.getContext('2d',{willReadFrequently:true}); ctx.drawImage(img,0,0,w,h);
-   const d=ctx.getImageData(0,0,w,h), a=d.data;
-   for(let i=0;i<a.length;i+=4){const g=.299*a[i]+.587*a[i+1]+.114*a[i+2];const v=Math.max(0,Math.min(255,(g-128)*1.35+128));a[i]=a[i+1]=a[i+2]=v;}
-   ctx.putImageData(d,0,0); c.toBlob(b=>b?resolve(b):reject(new Error('Image conversion failed')),'image/jpeg',.9);
-  }catch(e){reject(e)}};
-  img.onerror=()=>reject(new Error('Image could not be loaded')); img.src=URL.createObjectURL(file);
- });
-}
-async function runOCR(file,append=false){
+async function runOCR(file){
  if(!file)return;
  const preview=document.getElementById('scanPreview'), status=document.getElementById('scanStatus'), progress=document.getElementById('scanProgress'), bar=document.getElementById('scanProgressBar');
- preview.src=URL.createObjectURL(file);preview.style.display='block';progress.style.display='block';bar.style.width='2%';
+ preview.src=URL.createObjectURL(file);preview.style.display='block';progress.style.display='block';bar.style.width='2%';status.textContent='Preparing image for table OCR…';
+ let worker;
  try{
-  status.textContent='Preparing photo for OCR…';
-  const prepared=await preprocessImage(file);
-  const worker=await Tesseract.createWorker('eng',1,{logger:m=>{if(m.status)status.textContent=m.status.replace(/_/g,' ')+'…';if(typeof m.progress==='number')bar.style.width=Math.round(m.progress*100)+'%'}});
-  const {data:{text}}=await worker.recognize(prepared); await worker.terminate(); bar.style.width='100%';
-  const rows=parseOCR(text); ocrItems=append?ocrItems.concat(rows):rows; renderOCRReview();
-  status.textContent=rows.length?`Page read: ${rows.length} possible row(s).${append?'':' Review the rows below.'}`:'No usable rows detected on this page. Try a flatter, brighter photo.';
- }catch(e){console.error(e);status.innerHTML='<span class="dangerText">OCR could not read this photo. Please try a clear, well-lit photo.</span>';}
+   const enhanced=await preprocessImage(file);
+   worker=await Tesseract.createWorker('eng',1,{logger:m=>{if(m.status)status.textContent=m.status.replace(/_/g,' ')+'…';if(typeof m.progress==='number')bar.style.width=Math.max(2,Math.round(m.progress*100))+'%'}});
+   await worker.setParameters({preserve_interword_spaces:'1',user_defined_dpi:'300'});
+   const passes=[];
+   for(const psm of ['6','11']){
+     await worker.setParameters({tessedit_pageseg_mode:psm});
+     const r=await worker.recognize(enhanced,{},{tsv:true});
+     const data=r.data||{};
+     const rows=data.tsv?parseTSV(data.tsv, data.width||2200):parseOCR(data.text||'');
+     passes.push(rows);
+   }
+   await worker.terminate(); worker=null; bar.style.width='100%';
+   ocrItems=passes.sort((a,b)=>scoreOCR(b)-scoreOCR(a))[0]||[];
+   ocrItems=ocrItems.filter(x=>x.code||x.item).map(x=>({code:x.code||'',item:x.item||'',category:x.category||'OTHER',quantity:x.quantity||'',retail:x.retail||'',_conf:x._conf||0}));
+   status.textContent=ocrItems.length?`Found ${ocrItems.length} possible item row(s). The table columns were read separately — review before adding.`:'No usable rows were detected. Try a clearer, straighter photo with the page flat and well lit.';
+   renderOCRReview();
+ }catch(e){if(worker)try{await worker.terminate()}catch(_){} console.error(e);status.innerHTML='<span class="dangerText">OCR could not read this image. Please try another clear photo.</span>'}
 }
-document.getElementById('bulkPhoto').addEventListener('change',async e=>{
- const files=[...e.target.files];if(!files.length)return;ocrItems=[];document.getElementById('ocrReview').style.display='none';
- const status=document.getElementById('scanStatus');status.textContent=`Reading ${files.length} page${files.length>1?'s':''}…`;
- for(let i=0;i<files.length;i++){status.textContent=`Reading page ${i+1} of ${files.length}…`;await runOCR(files[i],true);}
- status.textContent=ocrItems.length?`Found ${ocrItems.length} possible row(s) across ${files.length} page${files.length>1?'s':''}. Review before adding.`:'No usable rows were detected. Try clearer photos.';renderOCRReview();
-});
+document.getElementById('bulkPhoto').addEventListener('change',e=>{ocrItems=[];document.getElementById('ocrReview').style.display='none';runOCR(e.target.files[0])});
 function commitOCRItems(){
  const valid=ocrItems.filter(x=>x.code||x.item).map(x=>({id:uid(),code:String(x.code||'').trim(),item:String(x.item||'').trim(),category:String(x.category||'OTHER').trim().toUpperCase(),quantity:Number(String(x.quantity||'').replace(/,/g,''))||0,retail:Number(String(x.retail||'').replace(/,/g,''))||0,photo:''}));
  if(!valid.length){alert('No valid items to add.');return}
@@ -256,7 +284,7 @@ function importBulk(){
    if(parts.length<2)return;
    const [code,item,category,quantity,retail]=parts;
    if(!code||!item)return;
-   inventory.push({id:uid(),code:code.trim(),item:item.trim(),category:normalizeCategory(category||item),quantity:Number(String(quantity||'').replace(/,/g,''))||0,retail:Number(String(retail||'').replace(/,/g,''))||0,photo:''});added++;
+   inventory.push({id:uid(),code:code.trim(),item:item.trim(),category:(category||inferCategory(item)).trim().toUpperCase(),quantity:Number(String(quantity||'').replace(/,/g,''))||0,retail:Number(String(retail||'').replace(/,/g,''))||0,photo:''});added++;
  });
  saveInventory();document.getElementById('bulkText').value='';closeBulk();render();alert(added+' item(s) added.');
 }
@@ -295,7 +323,6 @@ function openDetail(i){
  document.getElementById("detail").classList.add("show");
 }
 function closeDetail(){document.getElementById("detail").classList.remove("show")}
-if('serviceWorker' in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('service-worker.js').catch(()=>{}));}
 rebuildCategories();
 render();
 </script>
